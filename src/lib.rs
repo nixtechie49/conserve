@@ -16,7 +16,6 @@ extern crate log;
 
 extern crate blake2_rfc;
 extern crate chrono;
-extern crate cpuprofiler;
 extern crate isatty;
 extern crate rayon;
 extern crate rustc_serialize;

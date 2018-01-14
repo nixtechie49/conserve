@@ -18,7 +18,7 @@ doc = false  # Conflicts with library docs which are more useful.
 chrono = "0.2"
 clap = "~2.29"
 clippy = {version = "0.0.103", optional = true}
-cpuprofiler = "0.0.3"
+cpuprofiler = { version = "0.0.3", optional = true }
 error-chain = "0.11"
 isatty = "0.1"
 log = "^0.3"
@@ -43,3 +43,7 @@ vergen = "~0.1.0"
 
 [features]
 default = []
+
+# This needs `sudo apt-get install libgoogle-perftools-dev` or similar, and
+# only works on Linux.
+profile = ["cpuprofiler"]

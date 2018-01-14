@@ -1,5 +1,5 @@
 // Conserve backup system.
-// Copyright 2015, 2016, 2017 Martin Pool.
+// Copyright 2015, 2016, 2017, 2018 Martin Pool.
 
 //! Command-line entry point for Conserve backups.
 
@@ -16,6 +16,8 @@ extern crate log;
 extern crate clap;
 
 extern crate chrono;
+
+#[cfg(feature = "profile")]
 extern crate cpuprofiler;
 extern crate globset;
 
@@ -27,7 +29,23 @@ extern crate conserve;
 use conserve::*;
 use conserve::ui;
 
+
+#[cfg(not(feature = "profile"))]
 fn main() {
+    real_main()
+}
+
+#[cfg(feature = "profile")]
+fn main() {
+    use cpuprofiler::PROFILER;
+    PROFILER.lock().unwrap().start("./my-prof.profile").unwrap();
+    real_main();
+    // Note: real_main might terminate directly, and then no profile will be written.
+    PROFILER.lock().unwrap().stop().unwrap();
+}
+
+
+fn real_main() {
     let matches = make_clap().get_matches();
 
     let (sub_name, subm) = matches.subcommand();
@@ -55,12 +73,7 @@ fn main() {
     };
     let report = Report::with_ui(ui);
     report.become_logger(log_level);
-
-
-    use cpuprofiler::PROFILER;
-    PROFILER.lock().unwrap().start("./my-prof.profile").unwrap();
     let result = sub_fn(subm, &report);
-    PROFILER.lock().unwrap().stop().unwrap();
 
     info!("{}", report);
 

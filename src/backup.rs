@@ -1,10 +1,19 @@
 // Conserve backup system.
-// Copyright 2015, 2016, 2017 Martin Pool.
+// Copyright 2015, 2016, 2017, 2018 Martin Pool.
 
 //! Make a backup by walking a source directory and copying the contents
 //! into an archive.
 
 use super::*;
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use futures::Future;
+use futures::future;
+use futures::future::FutureResult;
+use futures_cpupool;
 
 
 #[derive(Debug)]
@@ -19,19 +28,27 @@ impl BackupOptions {
 }
 
 
+/// Make a new backup from a source tree into a band in this archive.
+pub fn make_backup(source: &LiveTree, archive: &Archive, _: &BackupOptions) -> Result<()> {
+    tree::copy_tree(source, &mut BackupWriter::begin(archive)?)
+}
+
+
 /// Accepts files to write in the archive (in apath order.)
 #[derive(Debug)]
 struct BackupWriter {
     band: Band,
     block_dir: BlockDir,
-    index_builder: IndexBuilder,
     report: Report,
-}
+    ib: IndexBuilder,
 
-
-/// Make a new backup from a source tree into a band in this archive.
-pub fn make_backup(source: &LiveTree, archive: &Archive, _: &BackupOptions) -> Result<()> {
-    tree::copy_tree(source, &mut BackupWriter::begin(archive)?)
+    // TODO: Seems like we shouldn't quite need Arc and Mutex here, because the entries are almost
+    // plain-old-data. However they do contain heap-allocated strings and vecs, and those are
+    // probably not safe to share across threads without protection. One way around this, perhaps,
+    // would be to treat the IndexBuilder as Arc/Mutex and have the entries push themselves into
+    // it, but that's not obviously any better.
+    pend: VecDeque<futures_cpupool::CpuFuture<Arc<Mutex<IndexEntry>>, Error>>,
+    pool: futures_cpupool::CpuPool,
 }
 
 
@@ -46,65 +63,98 @@ impl BackupWriter {
         Ok(BackupWriter {
             band: band,
             block_dir: block_dir,
-            index_builder: index_builder,
+            ib: index_builder,
             report: archive.report().clone(),
+            pend: VecDeque::new(),
+            pool: futures_cpupool::CpuPool::new_num_cpus(),
         })
     }
 
-    fn push_entry(&mut self, index_entry: IndexEntry) -> Result<()> {
-        self.index_builder.push(index_entry);
-        self.index_builder.maybe_flush(&self.report)?;
-        Ok(())
+    /// Append a future that will later produce an IndexEntry, and spawn it in the cpupool.
+    fn defer<F, R>(&mut self, f: F)
+        where F: FnOnce() -> R + Send + 'static,
+              R: futures::Future<Item = Arc<Mutex<IndexEntry>>, Error = Error> + Send + 'static,
+    {
+        // TODO: Peek into pend, and flush as many futures as have already completed.
+        // TODO: Test that with many entries, multiple index blocks are generated. This won't
+        // happen with the current code, which only flushes them at the end.
+        self.pend.push_back(self.pool.spawn_fn(f));
+        //self.index_builder.push(index_entry);
+        //self.index_builder.maybe_flush(&self.report)?;
     }
+}
+
+
+/// Make a future that just immediately returns an IndexEntry.
+fn immediate_result(ie: IndexEntry) ->
+    FutureResult<Arc<Mutex<IndexEntry>>, Error> {
+    future::ok(Arc::new(Mutex::new(ie)))
 }
 
 
 impl tree::WriteTree for BackupWriter {
     fn finish(&mut self) -> Result<()> {
-        self.index_builder.finish_hunk(&self.report)?;
+        // TODO: Flush pending futures
+        for p in self.pend.drain(..) {
+            let arc = p.wait()?;
+            // By the time the future completes, it should have released the mutex.
+            self.ib.push(
+                Arc::try_unwrap(arc).unwrap()
+                .into_inner().unwrap());
+        }
+        self.ib.finish_hunk(&self.report)?;
         self.band.close(&self.report)?;
         Ok(())
     }
 
-
     fn write_dir(&mut self, source_entry: &Entry) -> Result<()> {
         self.report.increment("dir", 1);
-        self.push_entry(IndexEntry {
-            apath: source_entry.apath().to_string().clone(),
-            mtime: source_entry.unix_mtime(),
-            kind: Kind::Dir,
-            addrs: vec![],
-            blake2b: None,
-            target: None,
-        })
+        let apath = source_entry.apath().to_string().clone();
+        let mtime = source_entry.unix_mtime();
+        self.defer(move || immediate_result(
+            IndexEntry {
+                apath: apath,
+                mtime: mtime,
+                kind: Kind::Dir,
+                addrs: vec![],
+                blake2b: None,
+                target: None,
+            }));
+        Ok(())
     }
 
     fn write_file(&mut self, source_entry: &Entry, content: &mut std::io::Read) -> Result<()> {
         self.report.increment("file", 1);
         // TODO: Cope graciously if the file disappeared after readdir.
         let (addrs, body_hash) = self.block_dir.store(content, &self.report)?;
-        self.push_entry(IndexEntry {
-            apath: source_entry.apath().to_string().clone(),
-            mtime: source_entry.unix_mtime(),
+        let apath = source_entry.apath().to_string().clone();
+        let mtime = source_entry.unix_mtime();
+        self.defer(move || immediate_result(IndexEntry {
+            apath: apath,
+            mtime: mtime,
             kind: Kind::File,
             addrs: addrs,
             blake2b: Some(body_hash),
             target: None,
-        })
+        }));
+        Ok(())
     }
 
     fn write_symlink(&mut self, source_entry: &Entry) -> Result<()> {
         self.report.increment("symlink", 1);
         let target = source_entry.symlink_target();
         assert!(target.is_some());
-        self.push_entry(IndexEntry {
-            apath: source_entry.apath().to_string().clone(),
-            mtime: source_entry.unix_mtime(),
+        let apath = source_entry.apath().to_string().clone();
+        let mtime = source_entry.unix_mtime();
+        self.defer(move || immediate_result(IndexEntry {
+            apath: apath,
+            mtime: mtime,
             kind: Kind::Symlink,
             addrs: vec![],
             blake2b: None,
             target: target,
-        })
+        }));
+        Ok(())
     }
 }
 

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use blake2_rfc::blake2b;
 use blake2_rfc::blake2b::Blake2b;
+use futures::Future;
 use rustc_serialize::hex::ToHex;
 
 use tempfile;
@@ -103,10 +104,14 @@ impl BlockDir {
         //   compress and store
         let mut addresses = Vec::<Address>::with_capacity(1);
         let mut file_hasher = Blake2b::new(BLAKE_HASH_SIZE_BYTES);
-        let mut in_buf = Vec::<u8>::with_capacity(MAX_BLOCK_SIZE);
+        let pool = futures_cpupool::CpuPool::new_num_cpus();
+        let mut comp_futures = Vec::<futures_cpupool::CpuFuture<u64, Error>>::new();
+
         loop {
+            let mut in_buf = Vec::<u8>::with_capacity(MAX_BLOCK_SIZE);
             unsafe {
                 // Increase size to capacity without initializing data that will be overwritten.
+                assert_eq!(in_buf.capacity(), MAX_BLOCK_SIZE);
                 in_buf.set_len(MAX_BLOCK_SIZE);
             };
             // TODO: Possibly read repeatedly in case we get a short read and have room for more,
@@ -140,13 +145,12 @@ impl BlockDir {
             if self.contains(&block_hash)? {
                 report.increment("block.already_present", 1);
             } else {
-                let comp_len = self.compress_and_store(&in_buf, &block_hash, &report)?;
-                // Maybe rename counter to 'block.write'?
+                comp_futures.push(self.compress_and_store(in_buf, &block_hash, &pool, &report)?);
                 report.increment("block.write", 1);
                 report.increment_size(
                     "block",
                     Sizes {
-                        compressed: comp_len,
+                        compressed: 0, // Don't know it yet.
                         uncompressed: read_len as u64,
                     },
                 );
@@ -156,6 +160,17 @@ impl BlockDir {
                 start: 0,
                 len: read_len as u64,
             });
+        }
+        // Collect all pending work.
+        for f in comp_futures.drain(..) {
+            let comp_len = f.wait()?;
+            report.increment_size(
+                "block",
+                Sizes {
+                    compressed: comp_len,
+                    uncompressed: 0, // Previously recorded.
+                },
+            );
         }
         match addresses.len() {
             0 => report.increment("file.empty", 1),
@@ -167,36 +182,40 @@ impl BlockDir {
 
     fn compress_and_store(
         &self,
-        in_buf: &[u8],
+        in_buf: Vec<u8>,
         hex_hash: &BlockHash,
-        report: &Report,
-    ) -> Result<u64> {
+        pool: &futures_cpupool::CpuPool,
+        _report: &Report,
+    ) -> Result<futures_cpupool::CpuFuture<u64, Error>> {
+        // TODO: Pass back counters and integrate into the report?
         super::io::ensure_dir_exists(&self.subdir_for(hex_hash))?;
-        let tempf = tempfile::NamedTempFileOptions::new()
-            .prefix("tmp")
-            .create_in(&self.path)?;
-        let mut bufw = io::BufWriter::new(tempf);
-        report.measure_duration("block.compress", || {
-            Snappy::compress_and_write(&in_buf, &mut bufw)
-        })?;
-        let tempf = bufw.into_inner().unwrap();
-        // report.measure_duration("sync", || tempf.sync_all())?;
+        let dir = self.path.clone();
+        let path = self.path_for_file(&hex_hash).clone();
+        Ok(pool.spawn_fn(move || {
+            let tempf = tempfile::NamedTempFileOptions::new()
+                .prefix("tmp")
+                .create_in(&dir)?;
+            let mut bufw = io::BufWriter::new(tempf);
+            Snappy::compress_and_write(&in_buf, &mut bufw)?;
 
-        // TODO: Count bytes rather than stat-ing.
-        let comp_len = tempf.metadata()?.len();
+            // TODO: Count bytes rather than stat-ing.
+            let tempf = bufw.into_inner().unwrap();
+            let comp_len = tempf.metadata()?.len();
 
-        // Also use plain `persist` not `persist_noclobber` to avoid
-        // calling `link` on Unix, which won't work on all filesystems.
-        if let Err(e) = tempf.persist(&self.path_for_file(&hex_hash)) {
-            if e.error.kind() == io::ErrorKind::AlreadyExists {
-                // Suprising we saw this rather than detecting it above.
-                warn!("Unexpected late detection of existing block {:?}", hex_hash);
-                report.increment("block.already_present", 1);
-            } else {
-                return Err(e.error.into());
+            // Also use plain `persist` not `persist_noclobber` to avoid
+            // calling `link` on Unix, which won't work on all filesystems.
+            if let Err(e) = tempf.persist(path) {
+                if e.error.kind() == io::ErrorKind::AlreadyExists {
+                    // Suprising we saw this rather than detecting it above.
+                    // warn!("Unexpected late detection of existing block {:?}", hex_hash);
+                    // inner_report.increment("block.already_present", 1);
+                } else {
+                    return Err(e.error.into());
+                }
             }
-        }
-        Ok(comp_len)
+            // TODO: Actually merge back the counts calculated here.
+            Ok(comp_len)
+        }))
     }
 
     /// True if the named block is present in this directory.

@@ -16,6 +16,7 @@ extern crate log;
 extern crate clap;
 
 extern crate chrono;
+extern crate cpuprofiler;
 extern crate globset;
 
 use chrono::Local;
@@ -55,7 +56,11 @@ fn main() {
     let report = Report::with_ui(ui);
     report.become_logger(log_level);
 
+
+    use cpuprofiler::PROFILER;
+    PROFILER.lock().unwrap().start("./my-prof.profile").unwrap();
     let result = sub_fn(subm, &report);
+    PROFILER.lock().unwrap().stop().unwrap();
 
     info!("{}", report);
 
